@@ -1,0 +1,8 @@
+{
+  "name": "우리 집",
+  "short_name": "우리 집",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#a1d3f7",
+  "theme_color": "#1b1846"
+}
