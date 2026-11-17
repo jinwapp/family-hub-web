@@ -30,7 +30,7 @@ const store = (k, v) => { try { v == null ? localStorage.removeItem(k) : localSt
 const load = k => { try { return localStorage.getItem(k) } catch { return null } }
 const S = {
   token: load('token'), me: null, tasks: [], checklists: {}, members: [], contacts: [], facts: [], shopping: [], shifts: [], devices: [],
-  message: null, undoNote: null, weather: null, briefing: null,
+  message: null, undoNote: null, weather: null, briefing: null, homePlace: null, push: null,
   chat: [], pending: null, thinking: false, draft: '', listening: false, heard: '', micDenied: false,
 }
 let rerender = () => {}
@@ -286,6 +286,49 @@ async function sendDraft() {
   if (isTablet() && S.chat.length > before && last && !last.mine) speak(last.text)
 }
 
+// ───────── 마감 알림 (Reminders.swift → 서버 Web Push) ─────────
+// 서버가 매일 9시에 내 담당 할 일의 "오늘까지"·"내일 마감"을 보낸다. iPhone 은 홈 화면에 추가한 앱에서만 받는다 (iOS 16.4+)
+const pushable = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window
+const b64bytes = s => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - s.length % 4) % 4)), c => c.charCodeAt(0))
+
+async function subscribePush() {
+  try {
+    const reg = await navigator.serviceWorker.ready
+    const k = await api('GET', '/push-key')
+    if (k.status !== 200) return
+    const key = b64bytes(k.json.publicKey)
+    let sub = await reg.pushManager.getSubscription()
+    if (!sub) {
+      try { sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key }) }
+      catch { const old = await reg.pushManager.getSubscription(); if (old) await old.unsubscribe(); sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key }) }
+    }
+    const j = sub.toJSON()
+    const r = await api('POST', '/push-subscription', { endpoint: j.endpoint, p256dh: j.keys.p256dh, auth: j.keys.auth })
+    set({ push: r.status === 204 ? 'on' : 'off' })
+  } catch { set({ push: 'off' }) }
+}
+
+/** 사람이 "켜기"를 눌렀을 때 (iOS 는 누른 순간에만 권한을 물을 수 있다) */
+async function enablePush() {
+  const perm = await Notification.requestPermission()
+  if (perm !== 'granted') return set({ push: 'denied' })
+  await subscribePush()
+}
+
+function startPush() {
+  if (!pushable()) return set({ push: 'unsupported' })
+  navigator.serviceWorker.register('sw.js').catch(() => {})
+  if (Notification.permission === 'granted') subscribePush() // 이미 켰으면 조용히 다시 알린다 (서버 키·기기가 바뀌었을 수 있다)
+  else set({ push: Notification.permission === 'denied' ? 'denied' : 'off' })
+}
+
+function PushBanner() {
+  if (S.push === 'off') return html`<div class="glass banner"><span>마감 알림을 받으려면 켜 주세요 (매일 오전 9시)</span><button class="pill primary" onClick=${enablePush}>알림 켜기</button></div>`
+  if (S.push === 'denied') return html`<p class="muted small banner-text">알림이 꺼져 있어요. 설정 > 알림에서 켜면 마감 알림을 받아요</p>`
+  if (S.push === 'unsupported') return html`<p class="muted small banner-text">Safari 공유 버튼 → "홈 화면에 추가"로 열면 마감 알림을 받을 수 있어요</p>`
+  return null
+}
+
 // ───────── 날짜 ─────────
 const pad = n => String(n).padStart(2, '0')
 const dayKey = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
@@ -409,6 +452,7 @@ function CalendarTab({ openTalk }) {
       <button class="icon" aria-label="할 일 추가" onClick=${() => setAdding(true)}>${I.plus}</button>
     <//>
     <${Message} />
+    <${PushBanner} />
     <section class="glass month">
       <div class="month-head">
         <h3>${month.getFullYear()}년 ${month.getMonth() + 1}월</h3>
@@ -761,6 +805,56 @@ function weatherText(w) {
   return { CLEAR: '맑음' + t, CLOUDY: '흐림' + t, RAIN: '비' + t + ' · 우산 챙기기', SNOW: '눈' + t + ' · 길 미끄러움' }[w.kind]
 }
 
+// 개발: ?weather=RAIN|SNOW|CLOUDY|CLEAR 로 배경을 미리 본다
+const forcedWeather = new URLSearchParams(location.search).get('weather')
+const weatherKind = () => forcedWeather || S.weather?.kind
+
+/** 비·눈 배경층: 칸마다 정해진 자리에서 떨어진다 (같은 칸이면 같은 자리라 깜빡이지 않는다) */
+function WeatherLayer({ kind }) {
+  const ref = useRef(null)
+  useEffect(() => {
+    if (kind !== 'RAIN' && kind !== 'SNOW') return
+    const cv = ref.current, g = cv.getContext('2d')
+    const still = matchMedia('(prefers-reduced-motion: reduce)').matches
+    const hash = n => { const v = Math.sin(n * 12.9898) * 43758.5453; return v - Math.floor(v) }
+    const drops = (w, h, cellW, cellH, per, speed, t, draw) => {
+      const cols = Math.floor(w / cellW) + 1, rows = Math.floor(h / cellH) + 2, fall = t * speed
+      for (let c = 0; c < cols; c++) for (let r = 0; r < rows; r++) for (let k = 0; k < per; k++) {
+        const n = c * 7919 + r * 104729 + k * 1301, s1 = hash(n), s2 = hash(n + 0.5)
+        draw((c + s1) * cellW, ((r + s2) * cellH + fall) % (rows * cellH) - cellH, s1)
+      }
+    }
+    let raf
+    const frame = ms => {
+      const dpr = devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight
+      if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr) }
+      g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h)
+      const t = still ? 0 : ms / 1000
+      if (kind === 'RAIN') {
+        g.lineCap = 'round'; g.shadowBlur = 0
+        for (const [lw, l0, l1, a0, a1, cw, ch, n, sp] of [[1, 14, 22, .3, .5, 110, 417, 12, 556], [1.4, 22, 32, .6, .85, 140, 278, 9, 660]])
+          drops(w, h, cw, ch, n, sp, t, (x, y, s) => {
+            const l = l0 + (l1 - l0) * s, a = a0 + (a1 - a0) * s
+            const gr = g.createLinearGradient(x, y, x, y + l)
+            gr.addColorStop(0, 'rgba(255,255,255,0)'); gr.addColorStop(1, `rgba(255,255,255,${0.9 * a})`)
+            g.strokeStyle = gr; g.lineWidth = lw; g.beginPath(); g.moveTo(x, y); g.lineTo(x, y + l); g.stroke()
+          })
+      } else {
+        g.shadowColor = 'rgba(20,50,110,.45)'; g.shadowBlur = 3
+        for (const [r0, r1, a, cw, ch, n, sp] of [[1, 2, .45, 170, 417, 12, 35], [2.5, 3.6, .85, 240, 278, 7, 40]])
+          drops(w, h, cw, ch, n, sp, t, (x, y, s) => {
+            g.fillStyle = `rgba(255,255,255,${a})`; g.beginPath()
+            g.arc(x + Math.sin(t * 0.6 + s * 6.28) * 8, y, r0 + (r1 - r0) * s, 0, Math.PI * 2); g.fill() // 살짝 흔들리며
+          })
+      }
+      if (!still) raf = requestAnimationFrame(frame)
+    }
+    raf = requestAnimationFrame(frame)
+    return () => cancelAnimationFrame(raf)
+  }, [kind])
+  return kind === 'RAIN' || kind === 'SNOW' ? html`<canvas class="wx" ref=${ref} aria-hidden="true"></canvas>` : null
+}
+
 function HubView() {
   const [now, setNow] = useState(new Date())
   const [page, setPage] = useState(0)
@@ -778,7 +872,9 @@ function HubView() {
   const theme = themeAt(now, S.weather?.sunrise, S.weather?.sunset)
   const night = theme === 'night'
   const onScroll = e => setPage(Math.round(e.target.scrollLeft / e.target.clientWidth))
-  return html`<div class=${'hub sky t-' + theme + (S.weather ? ' w-' + S.weather.kind.toLowerCase() : '')}>
+  const wx = weatherKind()
+  return html`<div class=${'hub sky t-' + theme + (wx ? ' w-' + wx.toLowerCase() : '')}>
+    <${WeatherLayer} kind=${wx} />
     <div class="pager" ref=${pager} onScroll=${onScroll}>
       <section class="hub-page"><${Ambient} now=${now} night=${night} /></section>
       <section class="hub-page"><${HubCalendar} now=${now} /></section>
@@ -798,13 +894,13 @@ function HubView() {
 
 function Ambient({ now, night }) {
   const list = [...S.tasks.filter(t => t.status === 'OPEN'), ...S.tasks.filter(doneToday)]
-  const w = weatherText(S.weather)
+  const w = weatherText(S.weather && { ...S.weather, kind: weatherKind() })
   return html`<div class="ambient">
     <div class="left">
       <span class="grow"></span>
       <p class="date">${now.getMonth() + 1}월 ${now.getDate()}일 ${WEEK[now.getDay()]}요일</p>
       <p class="clock">${pad(now.getHours())}:${pad(now.getMinutes())}</p>
-      ${w && html`<p class="weather">${WEATHER[S.weather.kind]?.[night ? 2 : 1]} ${w}</p>`}
+      ${w && html`<p class="weather">${WEATHER[weatherKind()]?.[night ? 2 : 1]} ${S.homePlace ? S.homePlace + ' · ' : ''}${w}</p>`}
       <span class="grow"></span><span class="grow"></span>
       <${ShiftChip} />
     </div>
@@ -908,7 +1004,7 @@ function HubMenu({ pick }) {
 async function hubJobs(g) {
   // 집 위치를 서버에 알려 주고 그 위치의 날씨를 받는다 (서버가 약 1km 로 반올림해서 저장)
   const pos = await here()
-  if (pos) await api('PUT', '/home-location', pos)
+  if (pos) { await api('PUT', '/home-location', pos); placeName(pos) }
   let weatherAt = 0, lastBriefing = ''
   while (g === gen) {
     if (Date.now() - weatherAt > 15 * 60000) {
@@ -933,6 +1029,17 @@ async function hubJobs(g) {
   }
 }
 
+/** 날씨 위치 이름 (예: "서울 중구"). 약 1km 로 줄인 좌표만 OpenStreetMap 에 묻는다 */
+async function placeName({ lat, lon }) {
+  try {
+    const r = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=14&accept-language=ko&lat=${lat.toFixed(2)}&lon=${lon.toFixed(2)}`)
+    const a = (await r.json()).address || {}
+    const city = (a.city || a.town || a.county || a.province || a.state || '').replace(/특별자치시|특별자치도|특별시|광역시/, '')
+    const name = [city, a.borough || a.city_district || a.suburb || a.village].filter(Boolean).join(' ')
+    if (name) set({ homePlace: name })
+  } catch {}
+}
+
 let wakeLock = null
 async function keepAwake() {
   try { if (navigator.wakeLock && document.visibilityState === 'visible') wakeLock = await navigator.wakeLock.request('screen') } catch {}
@@ -945,7 +1052,7 @@ function start() {
   if (!S.token || !S.me || started === gen) return
   started = gen
   watchChanges(gen)
-  if (isTablet()) { hubJobs(gen); keepAwake() }
+  if (isTablet()) { hubJobs(gen); keepAwake() } else startPush()
 }
 
 function App() {
