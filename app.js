@@ -60,11 +60,19 @@ function logout() {
   set({ token: null, me: null, tasks: [], checklists: {}, members: [], contacts: [], facts: [], shopping: [], shifts: [], devices: [], undoNote: null, message: null, weather: null, chat: [], pending: null })
 }
 
-async function pair(code) {
-  const r = await api('POST', '/pair', { code: code.trim().toUpperCase() })
-  if (r.status === 200) { store('token', r.json.token); S.token = r.json.token; await refresh(); start() }
+// 가족 공용 비밀번호로 연결한다. 먼저 비밀번호로 구성원 목록을 받고, 이 기기가 태블릿인지 누구 휴대폰인지 고른다
+async function loginMembers(password) {
+  const r = await api('POST', '/login/members', { password })
+  if (r.status === 200) return r.json.members
+  setMessage(r.status === 0 ? '서버에 닿지 않아요. 맥미니가 켜져 있는지 확인해 주세요' : (r.json?.reason || '연결하지 못했어요'))
+  return null
+}
+
+async function login(password, kind, memberId) {
+  const r = await api('POST', '/login', { password, kind, memberId })
+  if (r.status === 200) { setMessage(null); store('token', r.json.token); S.token = r.json.token; await refresh(); start() }
   else if (r.status === 0) setMessage('서버에 닿지 않아요. 맥미니가 켜져 있는지 확인해 주세요')
-  else setMessage(r.json?.reason || '등록하지 못했어요')
+  else setMessage(r.json?.reason || '연결하지 못했어요')
 }
 
 async function refresh() {
@@ -392,19 +400,31 @@ function Modal({ title, onClose, children, actions }) {
     </div></div>`
 }
 
-// ───────── 기기 등록 (PairView.swift) ─────────
+// ───────── 기기 연결 (가족 공용 비밀번호) ─────────
 function PairView() {
-  const [code, setCode] = useState('')
+  const [password, setPassword] = useState('')
+  const [members, setMembers] = useState(null) // 비밀번호가 맞으면 고를 구성원
   const [busy, setBusy] = useState(false)
+  const run = async f => { setBusy(true); await f(); setBusy(false) }
+  if (members) return html`<div class="sky t-morning center">
+    <div class="glass pair">
+      <h1>이 기기는 누구 거예요?</h1>
+      <${Message} />
+      <button class="pill primary big" disabled=${busy} onClick=${() => run(() => login(password, 'TABLET', null))}>집 태블릿 (허브)</button>
+      ${members.map(m => html`<button class="pill big" key=${m.id} disabled=${busy} onClick=${() => run(() => login(password, 'PHONE', m.id))}>${m.name} 휴대폰</button>`)}
+      <button class="link" onClick=${() => { setMembers(null); setMessage(null) }}>비밀번호 다시 넣기</button>
+    </div></div>`
   return html`<div class="sky t-morning center">
     <div class="glass pair">
       <h1>이 기기를 우리 집에 연결해요</h1>
-      <p class="muted">보호자 휴대폰에서 받은 8자리 등록 코드를 넣어 주세요. 10분 동안만 쓸 수 있어요.</p>
-      <input class="code" aria-label="등록 코드" placeholder="예: K7M2QX9P" autocapitalize="characters" autocomplete="off" spellcheck="false"
-        value=${code} onInput=${e => setCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8))} />
+      <p class="muted">우리 집 비밀번호를 넣어 주세요.</p>
+      <form onSubmit=${e => { e.preventDefault(); password && !busy && run(async () => { const m = await loginMembers(password); if (m) setMembers(m) }) }}>
+        <input class="code" type="password" aria-label="우리 집 비밀번호" placeholder="비밀번호" autocomplete="current-password"
+          value=${password} onInput=${e => setPassword(e.target.value)} />
+      </form>
       <${Message} />
-      <button class="pill primary big" disabled=${code.length < 8 || busy}
-        onClick=${async () => { setBusy(true); await pair(code); setBusy(false) }}>${busy ? '연결하는 중…' : '연결하기'}</button>
+      <button class="pill primary big" disabled=${!password || busy}
+        onClick=${() => run(async () => { const m = await loginMembers(password); if (m) setMembers(m) })}>${busy ? '확인하는 중…' : '다음'}</button>
     </div></div>`
 }
 
@@ -693,21 +713,15 @@ function MemoryView() {
 // ───────── 가족 (보호자) ─────────
 function FamilyView() {
   const [adding, setAdding] = useState(false)
-  const issue = async (kind, memberId, title) => {
-    const r = await api('POST', '/pairing-codes', { kind, memberId })
-    if (r.status === 200 || r.status === 201) alert(`${title}\n\n${r.json.code}\n\n새 기기에서 10분 안에 넣어 주세요`)
-    else { report(r); if (!S.message) setMessage('등록 코드를 받지 못했어요') }
-  }
   const revoke = async d => {
-    if (!confirm('이 기기의 연결을 끊을까요?\n다시 쓰려면 등록 코드로 새로 연결해야 해요')) return
+    if (!confirm('이 기기의 연결을 끊을까요?\n다시 쓰려면 우리 집 비밀번호로 새로 연결해야 해요')) return
     report(await api('POST', `/devices/${d.id}/revoke`)); await refresh()
   }
   return html`
     <${TitleBar} title="가족" />
     <${Message} />
     <section class="glass list"><h3>구성원</h3>
-      ${S.members.map(m => html`<div class="row" key=${m.id}><b>${m.name}</b><span class="muted small">${m.role === 'GUARDIAN' ? '보호자' : '아이'}</span><span class="grow"></span>
-        <button class="pill" onClick=${() => issue('PHONE', m.id, `${m.name} 휴대폰 등록 코드`)}>휴대폰 연결</button></div>`)}
+      ${S.members.map(m => html`<div class="row" key=${m.id}><b>${m.name}</b><span class="muted small">${m.role === 'GUARDIAN' ? '보호자' : '아이'}</span></div>`)}
       <button class="link strong" onClick=${() => setAdding(true)}>구성원 추가</button>
     </section>
     <section class="glass list"><h3>연결된 기기</h3>
@@ -715,8 +729,7 @@ function FamilyView() {
           <span>${d.kind === 'TABLET' ? '태블릿' : `${nameOf(d.memberId) ?? ''} 휴대폰`}</span>
           <span class="muted small">${new Date(d.createdAt).toLocaleDateString('ko-KR')} 연결</span></div>
         <button class="link danger" onClick=${() => revoke(d)}>연결 해제</button></div>`)}
-      <button class="link strong" onClick=${() => issue('TABLET', null, '태블릿 등록 코드')}>태블릿 연결</button>
-      <p class="muted small">잃어버린 기기는 연결을 해제해요</p>
+      <p class="muted small">새 기기는 우리 집 비밀번호로 연결해요. 잃어버린 기기는 연결을 해제해요</p>
     </section>
     ${adding && html`<${AddMember} onClose=${() => setAdding(false)} />`}`
 }
