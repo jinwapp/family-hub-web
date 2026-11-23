@@ -39,6 +39,8 @@ const sleep = ms => new Promise(r => setTimeout(r, ms))
 const uid = () => crypto.randomUUID ? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => ((Math.random() * 16) | (c === 'x' ? 0 : 8)).toString(16))
 const isGuardian = () => S.me?.role === 'GUARDIAN' && !!S.me?.memberId
 const isTablet = () => S.me?.kind === 'TABLET'
+/** 가족 관리(구성원·기기·담당·잊기): 보호자 휴대폰, 또는 비밀번호로 연결한 공용 기기 */
+const canManage = () => isGuardian() || isTablet()
 const nameOf = id => S.members.find(m => m.id === id)?.name
 const colorIdx = id => { const i = S.members.findIndex(m => m.id === id); return i < 0 ? null : i }
 const MEMBER_COLORS = ['#2b8be6', '#7c5ce6', '#e0559c', '#2fa36c', '#e07a12']
@@ -60,16 +62,20 @@ function logout() {
   set({ token: null, me: null, tasks: [], checklists: {}, members: [], contacts: [], facts: [], shopping: [], shifts: [], devices: [], undoNote: null, message: null, weather: null, chat: [], pending: null })
 }
 
-// 가족 공용 비밀번호로 연결한다. 먼저 비밀번호로 구성원 목록을 받고, 이 기기가 태블릿인지 누구 휴대폰인지 고른다
-async function loginMembers(password) {
-  const r = await api('POST', '/login/members', { password })
-  if (r.status === 200) return r.json.members
-  setMessage(r.status === 0 ? '서버에 닿지 않아요. 맥미니가 켜져 있는지 확인해 주세요' : (r.json?.reason || '연결하지 못했어요'))
-  return null
+// 가족 공용 비밀번호로 연결한다. 맞으면 이 기기는 가족 공용 기기가 된다 (누구 기기인지 고르지 않는다)
+// 기기 목록에서 구분할 이름. iPadOS Safari 는 Mac 으로 자신을 알리므로 터치 지원으로 가른다
+function deviceLabel() {
+  const ua = navigator.userAgent
+  const device = /iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1) ? 'iPad'
+    : /Android/.test(ua) ? 'Android' : /Macintosh/.test(ua) ? 'Mac' : /Windows/.test(ua) ? 'Windows' : /Linux/.test(ua) ? 'Linux' : '기기'
+  const browser = /Edg\//.test(ua) ? 'Edge' : /SamsungBrowser/.test(ua) ? '삼성 인터넷' : /CriOS|Chrome\//.test(ua) ? 'Chrome'
+    : /FxiOS|Firefox\//.test(ua) ? 'Firefox' : /Safari\//.test(ua) ? 'Safari' : ''
+  const app = matchMedia('(display-mode: standalone)').matches || navigator.standalone ? ' (홈 화면)' : ''
+  return [device, browser].filter(Boolean).join(' · ') + app
 }
 
-async function login(password, kind, memberId) {
-  const r = await api('POST', '/login', { password, kind, memberId })
+async function login(password) {
+  const r = await api('POST', '/login', { password, label: deviceLabel() })
   if (r.status === 200) { setMessage(null); store('token', r.json.token); S.token = r.json.token; await refresh(); start() }
   else if (r.status === 0) setMessage('서버에 닿지 않아요. 맥미니가 켜져 있는지 확인해 주세요')
   else setMessage(r.json?.reason || '연결하지 못했어요')
@@ -89,7 +95,7 @@ async function refresh() {
     if (facts) S.facts = facts
     if (shopping) S.shopping = shopping
     if (shifts) S.shifts = shifts
-    if (isGuardian()) { const d = await get('/devices', 'devices'); if (d) S.devices = d }
+    if (canManage()) { const d = await get('/devices', 'devices'); if (d) S.devices = d }
   }
   const m = await api('GET', '/members')
   if (m.status === 200) S.members = m.json.members
@@ -403,28 +409,18 @@ function Modal({ title, onClose, children, actions }) {
 // ───────── 기기 연결 (가족 공용 비밀번호) ─────────
 function PairView() {
   const [password, setPassword] = useState('')
-  const [members, setMembers] = useState(null) // 비밀번호가 맞으면 고를 구성원
   const [busy, setBusy] = useState(false)
-  const run = async f => { setBusy(true); await f(); setBusy(false) }
-  if (members) return html`<div class="sky t-morning center">
-    <div class="glass pair">
-      <h1>이 기기는 누구 거예요?</h1>
-      <${Message} />
-      <button class="pill primary big" disabled=${busy} onClick=${() => run(() => login(password, 'TABLET', null))}>집 태블릿 (허브)</button>
-      ${members.map(m => html`<button class="pill big" key=${m.id} disabled=${busy} onClick=${() => run(() => login(password, 'PHONE', m.id))}>${m.name} 휴대폰</button>`)}
-      <button class="link" onClick=${() => { setMembers(null); setMessage(null) }}>비밀번호 다시 넣기</button>
-    </div></div>`
+  const go = async () => { if (!password || busy) return; setBusy(true); await login(password); setBusy(false) }
   return html`<div class="sky t-morning center">
     <div class="glass pair">
       <h1>이 기기를 우리 집에 연결해요</h1>
       <p class="muted">우리 집 비밀번호를 넣어 주세요.</p>
-      <form onSubmit=${e => { e.preventDefault(); password && !busy && run(async () => { const m = await loginMembers(password); if (m) setMembers(m) }) }}>
+      <form onSubmit=${e => { e.preventDefault(); go() }}>
         <input class="code" type="password" aria-label="우리 집 비밀번호" placeholder="비밀번호" autocomplete="current-password"
           value=${password} onInput=${e => setPassword(e.target.value)} />
       </form>
       <${Message} />
-      <button class="pill primary big" disabled=${!password || busy}
-        onClick=${() => run(async () => { const m = await loginMembers(password); if (m) setMembers(m) })}>${busy ? '확인하는 중…' : '다음'}</button>
+      <button class="pill primary big" disabled=${!password || busy} onClick=${go}>${busy ? '연결하는 중…' : '연결하기'}</button>
     </div></div>`
 }
 
@@ -434,7 +430,7 @@ const TABS = [['달력', '📅'], ['출석부', '⏰'], ['연락처', '📞'], [
 function PhoneView({ start = 0, onHub }) {
   const [tab, setTab] = useState(start)
   const [talking, setTalking] = useState(false)
-  const tabs = TABS.filter((_, i) => i < 5 || isGuardian())
+  const tabs = TABS.filter((_, i) => i < 5 || canManage())
   const Page = [CalendarTab, AttendanceView, ContactsView, ShoppingView, MemoryView, FamilyView][tab]
   const openTalk = () => { setTalking(true); startVoice() } // 누른 순간 듣기 시작 (iOS 는 손댄 때만 마이크를 연다)
   return html`<div class="phone t-morning">
@@ -531,7 +527,7 @@ function AddTask({ onClose }) {
     <label class="line"><span>마감일</span><input type="checkbox" checked=${hasDue} onChange=${e => setHasDue(e.target.checked)} /></label>
     ${hasDue && html`<label class="line"><span>날짜</span><input type="date" value=${due} onInput=${e => setDue(e.target.value)} /></label>
       <label class="line"><span>반복</span><select value=${repeat} onChange=${e => setRepeat(e.target.value)}><option value="">안 함</option><option value="MONTH">매달</option><option value="YEAR">매년</option></select></label>`}
-    ${isGuardian() && html`<label class="line"><span>담당</span><select value=${assignee} onChange=${e => setAssignee(e.target.value)}>${S.members.map(m => html`<option value=${m.id}>${m.name}</option>`)}</select></label>`}
+    ${canManage() && html`<label class="line"><span>담당</span><select value=${assignee} onChange=${e => setAssignee(e.target.value)}>${S.members.map(m => html`<option value=${m.id}>${m.name}</option>`)}</select></label>`}
     ${!isTablet() && html`<label class="line"><span>나만 보기</span><input type="checkbox" checked=${priv} onChange=${e => setPriv(e.target.checked)} /></label>`}
     ${priv && html`<p class="muted small">다른 가족과 태블릿에는 보이지 않아요</p>`}
   <//>`
@@ -706,7 +702,7 @@ function MemoryView() {
       ${S.facts.map(f => html`<div class="row" key=${f.id}><div class="row-main col">
           <span>${f.onlyMe ? '🔒 ' : ''}${f.text}</span>
           ${f.saidBy && nameOf(f.saidBy) && html`<span class="muted small">${nameOf(f.saidBy)}${subj(nameOf(f.saidBy))} 알려 줌</span>`}</div>
-        ${isGuardian() && html`<button class="link danger" onClick=${() => confirm('이 기억을 지울까요?') && act('memory.forget', { id: f.id, expectedVersion: f.version }, { confirmed: true, note: '기억을 지웠어요' })}>잊기</button>`}</div>`)}
+        ${canManage() && html`<button class="link danger" onClick=${() => confirm('이 기억을 지울까요?') && act('memory.forget', { id: f.id, expectedVersion: f.version }, { confirmed: true, note: '기억을 지웠어요' })}>잊기</button>`}</div>`)}
     </section>`
 }
 
@@ -726,7 +722,7 @@ function FamilyView() {
     </section>
     <section class="glass list"><h3>연결된 기기</h3>
       ${S.devices.map(d => html`<div class="row" key=${d.id}><div class="row-main col">
-          <span>${d.kind === 'TABLET' ? '태블릿' : `${nameOf(d.memberId) ?? ''} 휴대폰`}</span>
+          <span>${d.kind === 'TABLET' ? (d.label ?? '공용 기기') : `${nameOf(d.memberId) ?? ''} · ${d.label ?? '휴대폰'}`}</span>
           <span class="muted small">${new Date(d.createdAt).toLocaleDateString('ko-KR')} 연결</span></div>
         <button class="link danger" onClick=${() => revoke(d)}>연결 해제</button></div>`)}
       <p class="muted small">새 기기는 우리 집 비밀번호로 연결해요. 잃어버린 기기는 연결을 해제해요</p>
@@ -868,7 +864,7 @@ function WeatherLayer({ kind }) {
   return kind === 'RAIN' || kind === 'SNOW' ? html`<canvas class="wx" ref=${ref} aria-hidden="true"></canvas>` : null
 }
 
-function HubView() {
+function HubView({ onTabs }) {
   const [now, setNow] = useState(new Date())
   const [page, setPage] = useState(0)
   const [full, setFull] = useState(null)
@@ -894,6 +890,7 @@ function HubView() {
     </div>
     ${S.briefing && html`<div class="briefing glass">${S.briefing}</div>`}
     <div class="toast-wrap top"><${UndoToast} /></div>
+    ${onTabs && html`<button class="pill hub-switch" onClick=${onTabs}>📱 탭 화면으로</button>`}
     <div class="controls">
       <${HubMenu} pick=${setFull} />
       <div class="mid"><div class="dots">${[0, 1].map(i => html`<i class=${i === page ? 'on' : ''}></i>`)}</div>
@@ -1081,7 +1078,11 @@ function App() {
   }, [S.token])
   if (!S.token) return html`<${PairView} />`
   if (!S.me) return html`<div class="sky t-morning center"><p class="muted">${S.message ?? '연결하는 중…'}</p></div>`
-  return isTablet() ? html`<${HubView} />` : html`<${PhoneView} />`
+  if (!isTablet()) return html`<${PhoneView} />`
+  // 공용 기기: 허브·탭 화면을 안에서 바꾼다. 처음엔 큰 화면이면 허브, 작으면 탭
+  const view = load('view') || (innerWidth >= 900 ? 'hub' : 'tabs')
+  const setView = v => { store('view', v); rerender() }
+  return view === 'hub' ? html`<${HubView} onTabs=${() => setView('tabs')} />` : html`<${PhoneView} onHub=${() => setView('hub')} />`
 }
 
 render(html`<${App} />`, document.getElementById('app'))
